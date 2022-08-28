@@ -148,14 +148,14 @@ AccesDecisionVoter 和 AccessDecisionManager 都有众多的实现类，在 Acce
                        if (wac == null) {
                            throw new IllegalStateException("No WebApplicationContext found: no ContextLoaderListener or DispatcherServlet registered?");
                        }
-   
+      
                        delegateToUse = this.initDelegate(wac);
                    }
-   
+      
                    this.delegate = delegateToUse;
                }
            }
-   
+      
            this.invokeDelegate(delegateToUse, request, response, filterChain);
        }
     ```
@@ -478,5 +478,353 @@ public class MyUserDetailService implements UserDetailsService {
 ```java
 http.logout().logoutUrl("login")//a标签里的退出路径
     .logoutSuccessUrl("/test/hello").permitAll();
+```
+
+## 13 自动登录
+
+### 13.1 实现原理
+
+1. 当认证成功之后，用cookie向浏览器存入加密字符串，再向数据库存入cookie的加密串和用户信息的字符串
+2. 再次访问，获取cookie信息，拿着cookie信息到数据库进行比对，如果查询到对应信息，认证成功，可以登录
+
+### 13.2 步骤
+
+1. 创建数据库表
+
+2. 配置类，注入数据源，配置操作数据库对象
+
+   ```java
+       @Bean
+       public PersistentTokenRepository persistent(){
+           JdbcTokenRepositoryImpl jdbc = new JdbcTokenRepositoryImpl();
+           jdbc.setCreateTableOnStartup(true);//自动创建数据库表
+           return jdbc;
+       }
+   ```
+
+3. 配置自动登录
+
+   ```java
+       protected void configure(HttpSecurity http) throws Exception {
+           http.rememberMe().tokenRepository(persistent())
+                   .tokenValiditySeconds(60)//设置有效时长
+                   .userDetailsService(userDetailsService);
+       }
+   ```
+
+4. 页面复选框的value值：remember-me
+
+## 14 CSRF
+
+跨站请求伪造
+
+### 14.1 Spring Security实现CSRF的原理
+
+1. 生成csrfToken保存到HttpSession或者cookie中
+
+# Spring Security微服务权限
+
+## 1 认证过程分析
+
+1. 如果是基于session，那么SpringSecurity会对cookie进行解析，找到服务器存储的session信息，然后判断当前用户是否符合请求的要求
+2. 如果是token，则是解析出token，然后将当前请求加入到SpringSecurity管理的权限信息中去
+
+## 2 编写SpringSecurity认证授权工具类和处理器
+
+### 2.1 密码处理工具类
+
+```java
+@Component
+public class DefaultPasswordEncoder implements PasswordEncoder {
+
+
+    public DefaultPasswordEncoder(){
+        this(-1);
+    }
+    public DefaultPasswordEncoder(int strength){
+
+    }
+    //进行MD5加密
+    @Override
+    public String encode(CharSequence charSequence) {
+        return MD5.encrypt(charSequence.toString());
+    }
+    //进行密码比对
+    @Override
+    public boolean matches(CharSequence charSequence, String s) {
+        return s.equals(MD5.encrypt(charSequence.toString()));
+    }
+}
+```
+
+### 2.2 token操作工具类
+
+```java
+@Component
+public class TokenManager {
+
+    //token有效时长
+    private long tokenEcpiration = 24*60*60*1000;
+
+    //编码密钥
+    private String tokenSignKey = "123456";
+    //使用JWT根据用户名生成token
+    public String createToken(String username){
+        String token = Jwts.builder().setSubject(username)
+                .setExpiration(new Date(System.currentTimeMillis()+tokenEcpiration))
+                .signWith(SignatureAlgorithm.HS512,tokenSignKey).compressWith(CompressionCodecs.GZIP).compact();
+        return token;
+    }
+
+    //根据token字符串得到用户信息
+    public String getUserInfoFromToken(String token){
+        String userinfo = Jwts.parser().setSigningKey(tokenSignKey).parseClaimsJws(token).getBody().getSubject();
+        return userinfo;
+    }
+
+    //删除token
+    public void remove(String token){
+        
+    }
+
+}
+```
+
+### 2.3 退出处理器
+
+```java
+public class TokenLogoutHandler implements LogoutHandler {
+
+    private TokenManager manager;
+    private RedisTemplate redisTemplate;
+    public TokenLogoutHandler(TokenManager tokenManager,RedisTemplate redisTemplate){
+        this.manager = tokenManager;
+        this.redisTemplate = redisTemplate;
+    }
+
+    @Override
+    public void logout(HttpServletRequest request, HttpServletResponse httpServletResponse, Authentication authentication) {
+        //从header里面获取到token
+        //token不为空，移除token，从redis删除token
+        String token = request.getHeader("token");
+        if(token!=null){
+            manager.remove(token);
+            //从token中获取用户名
+            String username = manager.getUserInfoFromToken(token);
+            redisTemplate.delete(username);
+        }
+        ResponseUtil.out(httpServletResponse, R.ok());
+    }
+}
+```
+
+### 2.4 未授权统一处理类
+
+```java
+public class UnauthEntryPoint implements AuthenticationEntryPoint {
+    @Override
+    public void commence(HttpServletRequest httpServletRequest, HttpServletResponse httpServletResponse, AuthenticationException e) throws IOException, ServletException {
+        ResponseUtil.out(httpServletResponse, R.error());
+    }
+}
+```
+
+## 3 自定义认证和授权过滤器
+
+### 3.1 认证过滤器
+
+```java
+public class TokenLoginFilter extends UsernamePasswordAuthenticationFilter {
+
+
+    private TokenManager tokenManager;
+    private RedisTemplate redisTemplate;
+    private AuthenticationManager authenticationManager;
+
+    public TokenLoginFilter(AuthenticationManager authenticationManager,TokenManager tokenManager,RedisTemplate redisTemplate){
+        this.authenticationManager = authenticationManager;
+        this.tokenManager = tokenManager;
+        this.authenticationManager = authenticationManager;
+        this.setPostOnly(false);
+        this.setRequiresAuthenticationRequestMatcher(new AntPathRequestMatcher("/admin/acl/login","POST"));//设置登录路径 匹配post提交
+    }
+    //获取表单提交用户名和密码
+    @Override
+    public Authentication attemptAuthentication(HttpServletRequest request, HttpServletResponse response) throws AuthenticationException {
+
+        //获取表单提交数据
+        try {
+            User user = new ObjectMapper().readValue(request.getInputStream(), User.class);
+            //交给springsecurity管理
+            return authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(user.getUsername(),user.getPassword(),new ArrayList<>()));
+        } catch (IOException e) {
+            e.printStackTrace();
+            throw new RuntimeException();
+        }
+
+    }
+
+    //认证成功
+
+    /**
+     *
+     * @param request
+     * @param response
+     * @param chain
+     * @param authResult 认证之后穿过来的内容
+     * @throws IOException
+     * @throws ServletException
+     */
+    @Override
+    protected void successfulAuthentication(HttpServletRequest request, HttpServletResponse response, FilterChain chain, Authentication authResult) throws IOException, ServletException {
+        //得到用户信息
+        SecurityUser user = (SecurityUser) authResult.getPrincipal();
+        //根据用户名生成token
+        String token = tokenManager.createToken(user.getCurrentUserInfo().getUsername());
+        //用户名和用户权限列表放入列表
+        redisTemplate.opsForValue().set(user.getCurrentUserInfo().getUsername(),user.getPermissionValueList());
+        //返回token
+        ResponseUtil.out(response, R.ok().data("token",token));
+
+
+    }
+
+    //认证失败
+    @Override
+    protected void unsuccessfulAuthentication(HttpServletRequest request, HttpServletResponse response, AuthenticationException failed) throws IOException, ServletException {
+        ResponseUtil.out(response,R.error());
+    }
+}
+```
+
+### 3.2 授权过滤器
+
+```java
+public class TokenAuthFilter extends BasicAuthenticationFilter {
+    private TokenManager tokenManager;
+    private RedisTemplate redisTemplate;
+    //获取
+
+
+
+    public TokenAuthFilter(AuthenticationManager authenticationManager) {
+        super(authenticationManager);
+        this.tokenManager = tokenManager;
+        this.redisTemplate = redisTemplate;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain) throws IOException, ServletException {
+        //获取当前认证成功用户权限信息
+        UsernamePasswordAuthenticationToken authRequest = getAuthentication(request);
+        //判断如果有权限，放到权限上下文中
+        if (authRequest != null){
+            SecurityContextHolder.getContext().setAuthentication(authRequest);
+        }
+        //放行
+        chain.doFilter(request,response);
+    }
+
+
+    public UsernamePasswordAuthenticationToken getAuthentication(HttpServletRequest request){
+
+        String token = request.getHeader("token");
+        if (token != null){
+            String username = tokenManager.getUserInfoFromToken(token);
+            //从redis获取对应权限列表
+            List<String> permissionValueList = (List<String>) redisTemplate.opsForValue().get(username);
+            Collection<GrantedAuthority> authorities = new ArrayList<>();
+            for(String permissionValue:permissionValueList){
+                SimpleGrantedAuthority auth = new SimpleGrantedAuthority(permissionValue);
+                authorities.add(auth);
+            }
+            return new UsernamePasswordAuthenticationToken(username,token,authorities);
+        }
+        return null;
+    }
+}
+```
+
+### 3 .3 核心配置类
+
+```java
+@Configuration
+public class TokenWebSecurityConfig extends WebSecurityConfigurerAdapter {
+
+    private TokenManager tokenManager;
+    private RedisTemplate redisTemplate;
+    private DefaultPasswordEncoder defaultPasswordEncoder;
+    private UserDetailsService userDetailsService;
+
+    @Autowired
+    public TokenWebSecurityConfig(TokenManager tokenManager,RedisTemplate redisTemplate,DefaultPasswordEncoder defaultPasswordEncoder,UserDetailsService userDetailsService){
+
+        this.tokenManager = tokenManager;
+        this.redisTemplate = redisTemplate;
+        this.defaultPasswordEncoder = defaultPasswordEncoder;
+        this.userDetailsService = userDetailsService;
+    }
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.exceptionHandling()
+                .authenticationEntryPoint(new UnauthEntryPoint())//没有权限访问
+                .and().csrf().disable()
+                .authorizeRequests()
+                .anyRequest().authenticated()
+                .and().logout().logoutUrl("/admin/acl/index/logout")//退出路径
+                .addLogoutHandler(new TokenLogoutHandler(tokenManager,redisTemplate)).and()
+                .addFilter(new TokenLoginFilter(authenticationManager(),tokenManager,redisTemplate))//添加自定义过滤器
+                .addFilter(new TokenAuthFilter(authenticationManager(),tokenManager,redisTemplate)).httpBasic();
+
+    }
+
+    //调用UserdetailService和密码处理
+
+    @Override
+    protected void configure(AuthenticationManagerBuilder auth) throws Exception {
+        //设置自定义userdetailservice和密码处理
+        auth.userDetailsService(userDetailsService).passwordEncoder(defaultPasswordEncoder);
+    }
+
+    @Override
+    public void configure(WebSecurity web) throws Exception {
+        //可以不用认证，直接访问路径
+        web.ignoring().antMatchers("/api/**");
+    }
+}
+```
+
+### 3.4 userDetailsService
+
+```java
+@Service("userDetailsService")
+public class UserDetailServiceImpl implements UserDetailsService {
+
+    @Autowired
+    private UserService userService;
+    @Autowired
+    private PermissionService permissionService;
+
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        //根据用户名查数据库
+        User user = userService.selectByUsername(username);
+        //判断
+        if(user == null){
+            throw new UsernameNotFoundException("用户不存在");
+        }
+        com.atguigu.security.entity.User curUser = new com.atguigu.security.entity.User();
+        BeanUtils.copyProperties(user,curUser);
+
+        //根据用户查询用户权限列表
+        List<String> list = permissionService.selectPermissionValueByUserId(user.getId());
+        SecurityUser securityUser = new SecurityUser();
+        securityUser.setPermissionValueList(list);
+
+        return securityUser;
+    }
+}
 ```
 
